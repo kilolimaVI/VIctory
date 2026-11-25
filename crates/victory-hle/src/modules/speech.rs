@@ -143,36 +143,82 @@ fn plain(ssml: &str) -> String {
 }
 
 /// The host's speech for `words` (SSML with `ssml`) as a WAVE file in the
-/// host synthesizer's format; `None` without a voice or on failure.
+/// host synthesizer's format; `None` without a voice, on failure, or if the
+/// host has not spoken within [`PATIENCE`].
+///
+/// One thread of our own, in the multithreaded apartment, owns the host's
+/// synthesizer and speaks one line at a time: synthesizers made, used and
+/// dropped on several threads at once end the process (`0xc0000409`).
 #[cfg(windows)]
 fn speak(words: &str, ssml: bool) -> Option<Vec<u8>> {
-    let words = windows::core::HSTRING::from(words);
-    // A thread of our own in the multithreaded apartment, whatever the
-    // title's thread initialised.
-    let spoken = std::thread::spawn(move || -> windows::core::Result<Vec<u8>> {
-        use windows::Media::SpeechSynthesis::SpeechSynthesizer;
-        use windows::Storage::Streams::DataReader;
-        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-        // SAFETY: initialises COM on this thread, which ends after the call.
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let synth = SpeechSynthesizer::new()?;
-        let stream = if ssml {
-            synth.SynthesizeSsmlToStreamAsync(&words)?.join()?
-        } else {
-            synth.SynthesizeTextToStreamAsync(&words)?.join()?
-        };
-        let size = u32::try_from(stream.Size()?).unwrap_or(u32::MAX);
-        let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
-        reader.LoadAsync(size)?.join()?;
-        let mut bytes = vec![0; reader.UnconsumedBufferLength()? as usize];
-        reader.ReadBytes(&mut bytes)?;
-        Ok(bytes)
-    })
-    .join()
-    .ok()?;
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
+
+    type Line = (String, bool, SyncSender<Option<Vec<u8>>>);
+    static QUEUE: OnceLock<Option<Sender<Line>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (queue, lines) = channel::<Line>();
+        let started = std::thread::Builder::new()
+            .name("speech".into())
+            .spawn(move || {
+                use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+                // SAFETY: initialises COM on this thread, kept for its life.
+                let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                let mut synth = None;
+                for (words, ssml, answer) in lines {
+                    let spoken = synthesize(&mut synth, &words, ssml).inspect_err(
+                        |e| tracing::debug!(error = %e, ssml, "speech synthesis failed"),
+                    );
+                    if spoken.is_err() {
+                        // Made anew for the next line.
+                        synth = None;
+                    }
+                    // The caller may have stopped waiting.
+                    let _ = answer.send(spoken.ok());
+                }
+            });
+        started.is_ok().then_some(queue)
+    });
+    let (answer, spoken) = sync_channel(1);
+    queue
+        .as_ref()?
+        .send((words.to_owned(), ssml, answer))
+        .ok()?;
     spoken
-        .inspect_err(|e| tracing::debug!(error = %e, ssml, "speech synthesis failed"))
-        .ok()
+        .recv_timeout(PATIENCE)
+        .inspect_err(|_| tracing::warn!("speech: the host did not speak in time; silence"))
+        .ok()?
+}
+
+/// How long a title thread waits for the speech thread.
+#[cfg(windows)]
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Speaks one line with the speech thread's synthesizer, made on first use.
+#[cfg(windows)]
+fn synthesize(
+    synth: &mut Option<windows::Media::SpeechSynthesis::SpeechSynthesizer>,
+    words: &str,
+    ssml: bool,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Media::SpeechSynthesis::SpeechSynthesizer;
+    use windows::Storage::Streams::DataReader;
+    if synth.is_none() {
+        *synth = Some(SpeechSynthesizer::new()?);
+    }
+    let synth = synth.as_ref().expect("made above");
+    let words = windows::core::HSTRING::from(words);
+    let stream = if ssml {
+        synth.SynthesizeSsmlToStreamAsync(&words)?.join()?
+    } else {
+        synth.SynthesizeTextToStreamAsync(&words)?.join()?
+    };
+    let size = u32::try_from(stream.Size()?).unwrap_or(u32::MAX);
+    let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
+    reader.LoadAsync(size)?.join()?;
+    let mut bytes = vec![0; reader.UnconsumedBufferLength()? as usize];
+    reader.ReadBytes(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(not(windows))]
@@ -403,5 +449,25 @@ mod tests {
     fn ssml_text_without_markup() {
         let words = plain("<speak>Press <emphasis>A</emphasis></speak>");
         assert_eq!(words.split_whitespace().collect::<Vec<_>>(), ["Press", "A"]);
+    }
+
+    /// Lines spoken on several title threads at once: each `speak` makes,
+    /// uses and drops a synthesizer on a thread of its own.
+    #[test]
+    fn lines_spoken_on_many_threads_at_once_all_come_back() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..3)
+                        .map(|_| spoken(0x68, c"Press A to continue").len())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for thread in threads {
+            for len in thread.join().expect("no thread panicked") {
+                assert!(len >= 44);
+            }
+        }
     }
 }
